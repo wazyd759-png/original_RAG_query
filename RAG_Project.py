@@ -4,6 +4,7 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.llms import Tongyi
+from sentence_transformers import CrossEncoder
 import os
 import shutil
 
@@ -49,6 +50,15 @@ retriever = db.as_retriever(
 
 test_query = "GPT5.6系列产品如何被推出的" 
 retrieved_docs = retriever.invoke(test_query)
+
+#重排
+reranker = CrossEncoder('BAAI/bge-reranker-base')
+pairs = [[test_query, doc.page_content] for doc in retrieved_docs]
+scores = reranker.predict(pairs)
+K = 3   # 最终保留的相关块数
+sorted_pairs = sorted(zip(retrieved_docs, scores), key=lambda x: x[1], reverse=True)
+top_docs = [doc for doc, _ in sorted_pairs[:K]]
+context_text = "\n\n---\n\n".join([doc.page_content for doc in top_docs])
 
 # ---------- 关键步骤：手动拼接上下文 ----------
 context_text = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
