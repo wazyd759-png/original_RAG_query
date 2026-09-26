@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.llms import Tongyi
@@ -17,8 +18,12 @@ from langchain_text_splitters import (
 )
 from sentence_transformers import CrossEncoder
 
-PROMPT = """你是一个专业的求职知识库助手。请根据以下上下文信息回答用户的问题。
-如果上下文不包含答案，请如实告知，不要编造。
+PROMPT = """你是一个专业的求职知识库助手。请根据以下提供的上下文信息回答用户的问题。
+
+重要规则：
+1. 优先参考与问题主体最匹配的上下文。例如，用户问"上海银行"，就优先使用包含"上海银行"的上下文。
+2. 如果某段上下文的主体（公司、岗位、人名等）与问题主体明显不一致，请忽略该段，不要用它来回答。
+3. 如果所有上下文都不包含答案，请如实告知"知识库中没有找到相关信息"，不要编造。
 
 上下文：
 {context}
@@ -28,6 +33,9 @@ PROMPT = """你是一个专业的求职知识库助手。请根据以下上下�
 
 请给出简洁、准确的回答：
 """
+
+# 文件名匹配时给的加成（加到重排分上）
+FILENAME_BONUS = 1.5
 
 
 class RAGEngine:
@@ -180,6 +188,38 @@ class RAGEngine:
     def stats(self) -> Dict[str, Any]:
         return {"total_chunks": self.db._collection.count()}
 
+    # ---------- 文件名加成 ----------
+    @staticmethod
+    def _filename_bonus(question: str, filename: str) -> float:
+        """文件名按分隔符切片，任意一片出现在问题里就加成。"""
+        if not filename:
+            return 0.0
+        stem = filename.rsplit(".", 1)[0]  # 去掉扩展名
+        parts = re.split(r"[-_·\s/（）()【】\[\]]+", stem)
+        for part in parts:
+            part = part.strip()
+            if len(part) >= 2 and part in question:
+                return FILENAME_BONUS
+        return 0.0
+
+    # ---------- 重排 + 文件名加成 ----------
+    def _rank(
+        self, question: str, docs: List[Document]
+    ) -> List[Tuple[Document, float, float]]:
+        """返回 [(doc, 原始重排分, 加成后分)]，按加成后分从高到低排序。"""
+        pairs = [[question, d.page_content] for d in docs]
+        scores = self.reranker.predict(pairs)
+
+        results: List[Tuple[Document, float, float]] = []
+        for doc, score in zip(docs, scores):
+            raw = float(score)
+            fname = doc.metadata.get("source_file", "")
+            bonus = self._filename_bonus(question, fname)
+            results.append((doc, raw, raw + bonus))
+
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results
+
     # ---------- 问答 ----------
     def ask(self, question: str, top_k: Optional[int] = None) -> Dict[str, Any]:
         question = (question or "").strip()
@@ -190,15 +230,11 @@ class RAGEngine:
         if not retrieved_docs:
             return {"answer": "抱歉，知识库中没有检索到相关内容。", "sources": []}
 
-        pairs = [[question, d.page_content] for d in retrieved_docs]
-        scores = self.reranker.predict(pairs)
-        ranked = sorted(
-            zip(retrieved_docs, scores), key=lambda x: float(x[1]), reverse=True
-        )
+        ranked = self._rank(question, retrieved_docs)
         k = top_k or self.rerank_top_k
         top = ranked[:k]
 
-        context_text = "\n\n---\n\n".join(d.page_content for d, _ in top)
+        context_text = "\n\n---\n\n".join(d.page_content for d, _, _ in top)
         formatted_prompt = self.prompt_template.format(
             question=question, context=context_text
         )
@@ -208,12 +244,13 @@ class RAGEngine:
             {
                 "index": i + 1,
                 "content": doc.page_content,
-                "score": round(float(score), 4),
+                "score": round(raw, 4),
+                "final_score": round(final, 4),
                 "source_file": doc.metadata.get("source_file", ""),
                 "source_path": doc.metadata.get("source_path", ""),
                 "metadata": dict(doc.metadata or {}),
             }
-            for i, (doc, score) in enumerate(top)
+            for i, (doc, raw, final) in enumerate(top)
         ]
 
         return {"answer": answer, "sources": sources}
